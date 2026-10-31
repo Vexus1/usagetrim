@@ -17,6 +17,52 @@ def test_cli_help():
     assert "Context compression engine" in res.output
 
 
+@pytest.mark.parametrize("model", ["openai", "claude", "llama"])
+def test_cli_tokens(model, monkeypatch):
+    from usagetrim.metrics import tokenizer
+
+    class Encoding:
+        name = "o200k_base"
+
+        def encode(self, text, *, disallowed_special):
+            return text.split()
+
+    monkeypatch.setattr(tokenizer, "get_o200k", lambda: Encoding())
+    monkeypatch.setattr(tokenizer, "_model_encoding", lambda name: Encoding())
+    result = runner.invoke(app, ["tokens", "hello world", "--model", model])
+    assert result.exit_code == 0
+    assert model in result.stdout and "tokens" in result.stdout
+    if model == "openai":
+        assert "2 tokens" in result.stdout and "o200k_base" in result.stdout
+        assert "estimate" not in result.stdout
+    else:
+        assert "estimate" in result.stdout
+        assert (
+            "legacy-o200k_base-x1.10" if model == "claude" else "utf8-bytes-div4-ceil"
+        ) in result.stdout
+
+
+def test_cli_tokens_defaults_to_openai(monkeypatch):
+    import tiktoken.registry
+
+    from usagetrim.metrics import tokenizer
+
+    monkeypatch.setattr(tokenizer, "_O200K_ENC", None)
+    monkeypatch.setattr(tokenizer, "_CL100K_ENC", None)
+    monkeypatch.setattr(tiktoken.registry, "ENCODINGS", {})
+    result = runner.invoke(app, ["tokens", "hello world"])
+    assert result.exit_code == 0
+    assert "openai" in result.stdout and "estimate" in result.stdout
+    assert "utf8-bytes-div4-ceil" in result.stdout
+
+
+def test_cli_tokens_unknown_model():
+    result = runner.invoke(app, ["tokens", "hello world", "--model", "unknown"])
+    assert result.exit_code == 2
+    assert "Unknown model" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_cli_pricing_lists_static_reference_rates(monkeypatch):
     from rich.console import Console
 

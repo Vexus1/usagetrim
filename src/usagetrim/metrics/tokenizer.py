@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from enum import Enum
 from typing import Literal
 
 import tiktoken
@@ -11,6 +12,91 @@ Provider = Literal["claude", "openai", "gemini"]
 # Cache tiktoken encodings
 _CL100K_ENC = None
 _O200K_ENC = None
+
+
+class ModelFamily(Enum):
+    OPENAI = "openai"
+    CLAUDE = "claude"
+    GEMINI = "gemini"
+    LLAMA = "llama"
+    GENERIC = "generic"
+
+
+@dataclass(frozen=True)
+class ModelTokenCount:
+    count: int
+    model: str
+    family: ModelFamily
+    method: str
+    is_estimate: bool
+
+    def __post_init__(self) -> None:
+        if type(self.count) is not int or self.count < 0:
+            raise ValueError("count must be a nonnegative integer")
+
+
+def _utf8_estimate(text: str) -> int:
+    """Uncalibrated size heuristic: ceil(UTF-8 bytes / 4), not a tokenizer."""
+    return (len(text.encode("utf-8")) + 3) // 4
+
+
+def _model_encoding(name: str):
+    """Reuse only instantiated encodings; never invoke a vocabulary loader.
+
+    Disk-only assets deliberately fall back to an estimate. Reading tiktoken's
+    cache safely would require coupling to its private loader and constructors.
+    """
+    for encoding in (_O200K_ENC, _CL100K_ENC):
+        if encoding is not None and getattr(encoding, "name", None) == name:
+            return encoding
+    from tiktoken import registry
+
+    # Isolated optional integration with tiktoken's in-memory registry. If its
+    # representation changes, fail closed rather than calling get_encoding().
+    encodings = getattr(registry, "ENCODINGS", None)
+    if isinstance(encodings, dict):
+        encoding = encodings.get(name)
+        if encoding is not None and getattr(encoding, "name", None) == name:
+            return encoding
+    raise ValueError("No instantiated local tiktoken encoding")
+
+
+def count_model_tokens(text: str, model: str) -> ModelTokenCount:
+    """Count plain text using an explicit family; excludes chat framing/billing.
+
+    Family selection is not selection of a particular provider model version.
+    Only o200k_base counts are unestimated encoding counts. Claude, Gemini,
+    Llama and generic results never claim to implement those models' tokenizers.
+    """
+    try:
+        family = ModelFamily(model)
+    except ValueError:
+        supported = ", ".join(item.value for item in ModelFamily)
+        raise ValueError(f"Unknown model: {model}. Supported values: {supported}") from None
+
+    count, method = _utf8_estimate(text), "utf8-bytes-div4-ceil"
+    if family in {ModelFamily.OPENAI, ModelFamily.CLAUDE, ModelFamily.GEMINI}:
+        for name in ("o200k_base", "cl100k_base"):
+            try:
+                encoding = _model_encoding(name)
+                count = len(encoding.encode(text, disallowed_special=()))
+                method = encoding.name
+                break
+            except (OSError, ValueError, RuntimeError, ImportError):
+                continue
+        if family is ModelFamily.CLAUDE:
+            count = math.ceil(count * 1.10)
+            method = f"legacy-{method}-x1.10"
+        elif family is ModelFamily.GEMINI:
+            count = math.ceil(count * 1.02)
+            method = f"legacy-{method}-x1.02"
+    return ModelTokenCount(
+        count=count,
+        model=model,
+        family=family,
+        method=method,
+        is_estimate=family is not ModelFamily.OPENAI or method != "o200k_base",
+    )
 
 
 def get_cl100k():

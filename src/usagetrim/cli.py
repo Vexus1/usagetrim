@@ -122,6 +122,24 @@ def _emit(text: str) -> str:
     return emitted
 
 
+@app.command("tokens")
+def tokens_command(
+    text: Annotated[str, typer.Argument(help="Plain text to count.")],
+    model: Annotated[
+        str, typer.Option(help="Model family: openai, claude, gemini, llama, generic.")
+    ] = "openai",
+):
+    """Count text with an explicit tokenizer or a labeled size estimate."""
+    from usagetrim.metrics.tokenizer import count_model_tokens
+
+    try:
+        result = count_model_tokens(text, model)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--model") from exc
+    kind = "estimate" if result.is_estimate else "encoding count"
+    typer.echo(f"{result.count} tokens · {result.family.value} · {kind} · {result.method}")
+
+
 @app.command("pricing")
 def pricing_command(
     model: Annotated[
