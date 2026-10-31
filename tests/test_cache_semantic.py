@@ -35,6 +35,22 @@ class FakeEmbedder:
 
 
 @pytest.fixture(autouse=True)
+def local_tokenizer(monkeypatch):
+    """Deterministic in-memory byte vocabulary; no downloaded test assets."""
+    import tiktoken
+
+    from usagetrim.metrics import tokenizer
+
+    encoding = tiktoken.Encoding(
+        name="test-byte-encoding",
+        pat_str=r"(?s).",
+        mergeable_ranks={bytes([i]): i for i in range(256)},
+        special_tokens={},
+    )
+    monkeypatch.setattr(tokenizer, "_O200K_ENC", encoding)
+
+
+@pytest.fixture(autouse=True)
 def forbid_network(monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("semantic retrieval attempted network access")
@@ -126,6 +142,88 @@ def test_full_lexical_coverage_does_not_load_backend(monkeypatch):
     before = inquiry_count(cache, ref)
     assert cache.hybrid_search(ref, "authentication failure") == expected
     assert inquiry_count(cache, ref) == before + 1
+
+
+def test_full_lexical_match_after_partial_candidate_limit():
+    cache = ContextCache()
+    diagnostic = "auth failure HTTP 401 Unauthorized"
+    ref = cache.store(
+        "\n".join(["auth"] * 90 + ["failure"] * 90 + [diagnostic] + ["ordinary"] * 29)
+    )
+    embedder = FakeEmbedder()
+    legacy = cache.search(ref, "auth failure", limit=3)
+    assert diagnostic not in legacy
+    output = cache.hybrid_search(ref, "auth failure", budget=1000, embedder=embedder)
+    assert diagnostic in output
+    assert f"# {ref} lines 181-210" in output
+    assert embedder.calls == []  # Full lexical matches have priority, no inference.
+    assert cache.search(ref, "auth failure", limit=3) == legacy
+
+
+@pytest.mark.parametrize("limit", [1, 3])
+def test_legacy_or_bm25_parity_while_hybrid_prioritizes_full_match(limit):
+    cache = ContextCache()
+    diagnostic = "auth failure HTTP 401 Unauthorized"
+    ref = cache.store(
+        "\n".join(["auth"] * 90 + ["failure"] * 90 + [diagnostic] + ["ordinary"] * 29)
+    )
+    # Pre-fix OR/BM25 ordering: repeated partial hits precede the full match.
+    expected = (
+        "\n".join(
+            f"# {ref} lines {first}-{first + 29}\n" + "\n".join(["auth"] * 30)
+            for first in [1, 31, 61][:limit]
+        )
+        + "\n[More matching chunks; narrow query or raise limit.]"
+    )
+    assert cache.search(ref, "auth failure", limit=limit) == expected
+    _, rows, complete = cache._search_snapshot(ref, "auth failure", limit)
+    assert [row[0] for row in rows[:limit]] == [1, 31, 61][:limit]
+    assert complete is False
+    embedder = FakeEmbedder()
+    hybrid = cache.hybrid_search(ref, "auth failure", budget=4000, limit=limit, embedder=embedder)
+    assert hybrid.startswith(f"# {ref} lines 181-210\n{diagnostic}\n")
+    assert embedder.calls == []
+    assert cache.search(ref, "auth failure", limit=limit) == expected
+
+
+@pytest.mark.parametrize("provider", ["openai", "claude", "gemini"])
+@pytest.mark.parametrize("query", ["auth failure", "HTTP"])
+def test_hybrid_cold_tokenizer_cache_without_semantic_backend(
+    monkeypatch, tmp_path, provider, query
+):
+    import math
+
+    import tiktoken.load
+    import tiktoken.registry
+
+    from usagetrim.metrics import tokenizer
+
+    def remote_read(*args, **kwargs):
+        raise AssertionError("tokenizer download attempted")
+
+    empty = tmp_path / "empty-tokenizer-cache"
+    empty.mkdir()
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(empty))
+    monkeypatch.setattr(tokenizer, "_O200K_ENC", None)
+    monkeypatch.setattr(tokenizer, "_CL100K_ENC", None)
+    monkeypatch.setattr(tiktoken.registry, "ENCODINGS", {})
+    monkeypatch.setattr(tiktoken.load, "read_file", remote_read)
+    monkeypatch.setattr(tiktoken, "get_encoding", remote_read)
+    monkeypatch.delenv("USAGETRIM_SEMANTIC_MODEL_PATH", raising=False)
+    monkeypatch.setitem(sys.modules, "fastembed", None)
+    cache = ContextCache()
+    ref = cache.store("HTTP 401 Unauthorized: żółć")
+    assert cache.search(ref, "auth failure").startswith("No matches")
+    output = cache.hybrid_search(ref, query, budget=128, token_provider=provider)
+    if query == "HTTP":
+        assert "HTTP 401 Unauthorized: żółć" in output
+    else:
+        assert output.startswith("No matches")
+    multiplier = {"openai": 1, "claude": 1.10, "gemini": 1.02}[provider]
+    assert math.ceil(len((output + "\n").encode("utf-8")) * multiplier) <= 128
+    with pytest.raises(ValueError, match="budget"):
+        cache.hybrid_search(ref, query, budget=1, token_provider=provider)
+    assert list(empty.iterdir()) == []
 
 
 @pytest.mark.parametrize("reason", ["unset", "missing", "invalid", "dependency"])

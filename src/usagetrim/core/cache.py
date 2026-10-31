@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import sqlite3
 import time
@@ -265,14 +266,17 @@ class ContextCache:
                 (expression, ref_id, limit + 1),
             ).fetchall()
             # terms() emits quoted words joined by OR; retain FTS token semantics.
-            complete = (
-                check_complete
-                and conn.execute(
-                    "SELECT 1 FROM recovery_search WHERE recovery_search MATCH ? AND ref=? LIMIT 1",
-                    (expression.replace(" OR ", " AND "), ref_id),
-                ).fetchone()
-                is not None
-            )
+            complete = False
+            if check_complete:
+                full = conn.execute(
+                    "SELECT first,last,body FROM recovery_search WHERE recovery_search MATCH ? AND ref=? ORDER BY bm25(recovery_search),CAST(first AS INTEGER) LIMIT ?",
+                    (expression.replace(" OR ", " AND "), ref_id, limit + 1),
+                ).fetchall()
+                # Completeness must refer to retained candidates, not an unseen
+                # match elsewhere in the record. Keep full matches first.
+                full_ranges = {(first, last) for first, last, _ in full}
+                rows = (full + [r for r in rows if (r[0], r[1]) not in full_ranges])[: limit + 1]
+                complete = bool(full)
         return original, rows, complete
 
     @staticmethod
@@ -302,17 +306,38 @@ class ContextCache:
         embedder=None,
     ) -> str:
         """Opt-in, offline semantic fallback; vectors live only for this call."""
-        from usagetrim.metrics.tokenizer import count_tokens
+        from tiktoken import registry
+
+        from usagetrim.metrics import tokenizer
 
         if type(budget) is not int or budget < 1:
             raise ValueError("budget must be a positive integer")
         if token_provider not in {"openai", "claude", "gemini"}:
             raise ValueError("token_provider must be openai, claude or gemini")
 
+        # Never call get_encoding/legacy getters: they can download on cold cache.
+        ready = getattr(registry, "ENCODINGS", {})
+        ready = ready if isinstance(ready, dict) else {}
+        encoding = (
+            tokenizer._O200K_ENC
+            or ready.get("o200k_base")
+            or tokenizer._CL100K_ENC
+            or ready.get("cl100k_base")
+        )
+
         def fits(text):
             # Include the newline that CLI _emit adds to its stdout.
             emitted = text + ("\n" if text and not text.endswith("\n") else "")
-            return getattr(count_tokens(emitted), token_provider) <= budget
+            # Byte-level BPE cannot emit more tokens than UTF-8 bytes. Unlike
+            # bytes/4, this cold-cache fallback is an upper bound, not an average.
+            count = len(emitted.encode("utf-8"))
+            if encoding is not None:
+                try:
+                    count = len(encoding.encode(emitted, disallowed_special=()))
+                except (ValueError, RuntimeError):
+                    pass  # Retain the conservative byte bound on encoding failure.
+            multiplier = {"openai": 1, "claude": 1.10, "gemini": 1.02}[token_provider]
+            return math.ceil(count * multiplier) <= budget
 
         original, lexical, complete = self._search_snapshot(
             ref_id, query, limit, check_complete=True
